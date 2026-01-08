@@ -1,70 +1,134 @@
-import boto3
+
 import json
-from botocore.exceptions import ClientError
-from datetime import datetime
+import os
+import sys
+import boto3
+import streamlit as st
 
-def blog_generate_using_bedrock(blogtopic: str) -> str:
-    """Generate a blog post using Meta Llama3 on AWS Bedrock."""
-    client = boto3.client("bedrock-runtime", region_name="us-west-2")
-    model_id = "meta.llama3-70b-instruct-v1:0"
+## We will be suing Titan Embeddings Model To generate Embedding
 
-    formatted_prompt = f"""
-    <|begin_of_text|><|start_header_id|>user<|end_header_id|>
-    Write a short, engaging blog about: {blogtopic}
-    <|eot_id|>
-    <|start_header_id|>assistant<|end_header_id|>
-    """
+from langchain_community.embeddings import BedrockEmbeddings
+from langchain.llms.bedrock import Bedrock
 
-    native_request = {
-        "prompt": formatted_prompt,
-        "max_gen_len": 512,
-        "temperature": 0.5,
-    }
+## Data Ingestion
 
-    try:
-        response = client.invoke_model(
-            modelId=model_id,
-            body=json.dumps(native_request),
-            contentType="application/json",
-            accept="application/json"
-        )
-    except ClientError as e:
-        print(f"AWS error: {e}")
-        return None
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        return None
+import numpy as np
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFDirectoryLoader
 
-    model_response = json.loads(response["body"].read())
-    return model_response.get("generation", "").strip()
+# Vector Embedding And Vector Store
 
-def save_blog_to_s3(s3_key,s3_bucket,generate_blog):
-    s3 = boto3.client('s3')
+from langchain.vectorstores import FAISS
 
-    try:
-        s3.put_object(Bucket = s3_bucket, Key = s3_key, Body = generate_blog)
-        print("Code saved to s3")
+## LLm Models
+from langchain.prompts import PromptTemplate
+from langchain.chains import RetrievalQA
 
-    except Exception as e:
-        print("Error when saving the code to s3")
+## Bedrock Clients
+bedrock=boto3.client(service_name="bedrock-runtime")
+bedrock_embeddings=BedrockEmbeddings(model_id="amazon.titan-embed-text-v1",client=bedrock)
 
 
+## Data ingestion
+def data_ingestion():
+    loader=PyPDFDirectoryLoader("data")
+    documents=loader.load()
 
-def lambda_handler(event, context):
-    # TODO implement 
-    event=json.loads(event['body'])
-    blogtopic=event['blog_topic']
-    generate_blog=blog_generate_using_bedrock(blogtopic=blogtopic)
+    # - in our testing Character split works better with this PDF data set
+    text_splitter=RecursiveCharacterTextSplitter(chunk_size=10000,
+                                                 chunk_overlap=1000)
+    
+    docs=text_splitter.split_documents(documents)
+    return docs
 
-    if generate_blog:
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        s3_key = f"blogs/{blogtopic.replace(' ', '_')}_{current_time}.txt"
-        s3_bucket = "aws_bedrock_counsol"  # Replace with your S3 bucket name
-        save_blog_to_s3(s3_key,s3_bucket,generate_blog)
-    else:
-        print("Blog generation failed.")
+## Vector Embedding and vector store
 
-    return{
-        'statusCode':200,
-        'body':json.dumps('Blog Generation is completed')
-    }
+def get_vector_store(docs):
+    vectorstore_faiss=FAISS.from_documents(
+        docs,
+        bedrock_embeddings
+    )
+    vectorstore_faiss.save_local("faiss_index")
+
+def get_claude_llm():
+    ##create the Anthropic Model
+    llm=Bedrock(model_id="ai21.j2-mid-v1",client=bedrock,
+                model_kwargs={'maxTokens':512})
+    
+    return llm
+
+def get_llama2_llm():
+    ##create the Anthropic Model
+    llm=Bedrock(model_id="meta.llama2-70b-chat-v1",client=bedrock,
+                model_kwargs={'max_gen_len':512})
+    
+    return llm
+
+prompt_template = """
+
+Human: Use the following pieces of context to provide a 
+concise answer to the question at the end but usse atleast summarize with 
+250 words with detailed explaantions. If you don't know the answer, 
+just say that you don't know, don't try to make up an answer.
+<context>
+{context}
+</context
+
+Question: {question}
+
+Assistant:"""
+
+PROMPT = PromptTemplate(
+    template=prompt_template, input_variables=["context", "question"]
+)
+
+def get_response_llm(llm,vectorstore_faiss,query):
+    qa = RetrievalQA.from_chain_type(
+    llm=llm,
+    chain_type="stuff",
+    retriever=vectorstore_faiss.as_retriever(
+        search_type="similarity", search_kwargs={"k": 3}
+    ),
+    return_source_documents=True,
+    chain_type_kwargs={"prompt": PROMPT}
+)
+    answer=qa({"query":query})
+    return answer['result']
+
+
+def main():
+    st.set_page_config("Chat PDF")
+    
+    st.header("Chat with PDF using AWS Bedrock💁")
+
+    user_question = st.text_input("Ask a Question from the PDF Files")
+
+    with st.sidebar:
+        st.title("Update Or Create Vector Store:")
+        
+        if st.button("Vectors Update"):
+            with st.spinner("Processing..."):
+                docs = data_ingestion()
+                get_vector_store(docs)
+                st.success("Done")
+
+    if st.button("Claude Output"):
+        with st.spinner("Processing..."):
+            faiss_index = FAISS.load_local("faiss_index", bedrock_embeddings)
+            llm=get_claude_llm()
+            
+            #faiss_index = get_vector_store(docs)
+            st.write(get_response_llm(llm,faiss_index,user_question))
+            st.success("Done")
+
+    if st.button("Llama2 Output"):
+        with st.spinner("Processing..."):
+            faiss_index = FAISS.load_local("faiss_index", bedrock_embeddings)
+            llm=get_llama2_llm()
+            
+            #faiss_index = get_vector_store(docs)
+            st.write(get_response_llm(llm,faiss_index,user_question))
+            st.success("Done")
+
+if __name__ == "__main__":
+    main()
